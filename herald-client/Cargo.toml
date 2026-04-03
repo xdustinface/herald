@@ -1,0 +1,15 @@
+[package]
+name = "herald-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Client library for connecting to the Herald message broker"
+
+[dependencies]
+herald-core = { path = "../herald-core" }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+serde_json = "1"
+tracing = "0.1"

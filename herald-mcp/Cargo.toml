@@ -1,0 +1,17 @@
+[package]
+name = "herald-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "MCP shim for Claude Code integration with Herald"
+
+[dependencies]
+herald-client = { path = "../herald-client" }
+herald-core = { path = "../herald-core" }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

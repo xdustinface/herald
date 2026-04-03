@@ -1,0 +1,12 @@
+auto_review: true
+auto_approve: true
+exclude_paths:
+  - "*.lock"
+instructions: |
+  This is a Rust workspace implementing an MCP message broker.
+  Focus on async correctness, WebSocket handling, and MCP protocol compliance.
+memory:
+  enabled: true
+models:
+  reviewer: claude-sonnet-4-6
+  judge: claude-opus-4-6
