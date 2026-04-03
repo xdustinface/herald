@@ -322,8 +322,10 @@ dependencies = [
 name = "herald-client"
 version = "0.1.0"
 dependencies = [
+ "futures-util",
  "herald-core",
  "serde_json",
+ "thiserror",
  "tokio",
  "tokio-tungstenite",
  "tracing",
