@@ -1,0 +1,900 @@
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use futures_util::stream::SplitSink;
+use futures_util::{SinkExt, StreamExt};
+use herald_core::{Address, ClientMessage, EndpointId, Message, ServerMessage, Topic};
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, oneshot};
+use tokio_tungstenite::tungstenite;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tracing::{debug, error, warn};
+
+use crate::config::ClientConfig;
+use crate::error::ClientError;
+use crate::reconnect::ReconnectPolicy;
+
+/// Timeout applied to handshake responses (auth, register) during connect and reconnect.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, tungstenite::Message>;
+type Result<T> = std::result::Result<T, ClientError>;
+
+/// Pending request state for commands that expect a specific response from the broker.
+enum Pending {
+    Subscribe(Topic, oneshot::Sender<Result<()>>),
+    Unsubscribe(Topic, oneshot::Sender<Result<()>>),
+    ListEndpoints(oneshot::Sender<Result<Vec<EndpointId>>>),
+    ListTopics(oneshot::Sender<Result<Vec<Topic>>>),
+    Send(oneshot::Sender<Result<()>>),
+}
+
+/// Commands sent from the public API to the background connection task.
+enum Command {
+    Send {
+        message: Message,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Subscribe {
+        topic: Topic,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Unsubscribe {
+        topic: Topic,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ListEndpoints {
+        reply: oneshot::Sender<Result<Vec<EndpointId>>>,
+    },
+    ListTopics {
+        reply: oneshot::Sender<Result<Vec<Topic>>>,
+    },
+    Disconnect {
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
+
+/// A client for the Herald message broker.
+///
+/// Maintains a WebSocket connection, handles authentication, and provides
+/// async methods for sending and receiving messages. Automatically reconnects
+/// on connection loss using exponential backoff.
+pub struct HeraldClient {
+    endpoint_id: EndpointId,
+    cmd_tx: mpsc::Sender<Command>,
+    msg_rx: mpsc::Receiver<Message>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for HeraldClient {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl HeraldClient {
+    /// Connects to the broker, authenticates, and registers the given endpoint name.
+    pub async fn connect(config: ClientConfig, name: &str) -> Result<Self> {
+        let endpoint_id =
+            EndpointId::new(name).map_err(|e| ClientError::Protocol(e.to_string()))?;
+
+        let token = read_token(&config.token_path).await?;
+
+        let (mut ws_sink, mut ws_stream) = establish_connection(&config.broker_url).await?;
+
+        handshake(&mut ws_sink, &mut ws_stream, &token, &endpoint_id).await?;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (msg_tx, msg_rx) = mpsc::channel(256);
+
+        let task = tokio::spawn(connection_task(
+            config,
+            endpoint_id.clone(),
+            ws_sink,
+            ws_stream,
+            cmd_rx,
+            msg_tx,
+        ));
+
+        Ok(Self {
+            endpoint_id,
+            cmd_tx,
+            msg_rx,
+            task: Some(task),
+        })
+    }
+
+    /// Sends a message to the given address.
+    pub async fn send_message(
+        &self,
+        to: Address,
+        payload: serde_json::Value,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let message = Message {
+            from: self.endpoint_id.clone(),
+            to,
+            payload,
+            metadata,
+            timestamp: now_ms(),
+        };
+        self.cmd_tx
+            .send(Command::Send {
+                message,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ClientError::Send("client disconnected".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ClientError::Send("no response from connection task".into()))?
+    }
+
+    /// Subscribes to a topic.
+    pub async fn subscribe(&self, topic: Topic) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Subscribe {
+                topic,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ClientError::Send("client disconnected".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ClientError::Send("no response from connection task".into()))?
+    }
+
+    /// Unsubscribes from a topic.
+    pub async fn unsubscribe(&self, topic: Topic) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Unsubscribe {
+                topic,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| ClientError::Send("client disconnected".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ClientError::Send("no response from connection task".into()))?
+    }
+
+    /// Lists all endpoints currently registered with the broker.
+    pub async fn list_endpoints(&self) -> Result<Vec<EndpointId>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ListEndpoints { reply: reply_tx })
+            .await
+            .map_err(|_| ClientError::Send("client disconnected".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ClientError::Send("no response from connection task".into()))?
+    }
+
+    /// Lists all active topics on the broker.
+    pub async fn list_topics(&self) -> Result<Vec<Topic>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ListTopics { reply: reply_tx })
+            .await
+            .map_err(|_| ClientError::Send("client disconnected".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| ClientError::Send("no response from connection task".into()))?
+    }
+
+    /// Returns a reference to the incoming message receiver.
+    /// Use this to consume messages delivered to this endpoint.
+    pub fn messages(&mut self) -> &mut mpsc::Receiver<Message> {
+        &mut self.msg_rx
+    }
+
+    /// Disconnects from the broker gracefully.
+    pub async fn disconnect(self) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let _ = self
+            .cmd_tx
+            .send(Command::Disconnect { reply: reply_tx })
+            .await;
+        reply_rx
+            .await
+            .map_err(|_| ClientError::Send("no response from connection task".into()))?
+    }
+}
+
+/// Background task that owns the WebSocket connection, processes commands,
+/// dispatches incoming messages, and handles reconnection.
+async fn connection_task(
+    config: ClientConfig,
+    endpoint_id: EndpointId,
+    mut ws_sink: WsSink,
+    mut ws_stream: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    mut cmd_rx: mpsc::Receiver<Command>,
+    msg_tx: mpsc::Sender<Message>,
+) {
+    let mut subscriptions: HashSet<Topic> = HashSet::new();
+    let mut reconnect_policy = ReconnectPolicy::new(config.reconnect.clone());
+    let mut pending: Vec<Pending> = Vec::new();
+
+    loop {
+        tokio::select! {
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    Command::Send { message, reply } => {
+                        let client_msg = ClientMessage::Send { id: None, message };
+                        match send_raw_direct(&mut ws_sink, &client_msg).await {
+                            Ok(()) => {
+                                pending.push(Pending::Send(reply));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                    Command::Subscribe { topic, reply } => {
+                        let client_msg = ClientMessage::Subscribe { topic: topic.clone() };
+                        match send_raw_direct(&mut ws_sink, &client_msg).await {
+                            Ok(()) => {
+                                pending.push(Pending::Subscribe(topic, reply));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                    Command::Unsubscribe { topic, reply } => {
+                        let client_msg = ClientMessage::Unsubscribe { topic: topic.clone() };
+                        match send_raw_direct(&mut ws_sink, &client_msg).await {
+                            Ok(()) => {
+                                pending.push(Pending::Unsubscribe(topic, reply));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                    Command::ListEndpoints { reply } => {
+                        match send_raw_direct(&mut ws_sink, &ClientMessage::ListEndpoints).await {
+                            Ok(()) => {
+                                pending.push(Pending::ListEndpoints(reply));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                    Command::ListTopics { reply } => {
+                        match send_raw_direct(&mut ws_sink, &ClientMessage::ListTopics).await {
+                            Ok(()) => {
+                                pending.push(Pending::ListTopics(reply));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                    Command::Disconnect { reply } => {
+                        fail_pending(&mut pending);
+                        let result = ws_sink.close().await
+                            .map_err(|e| ClientError::Connection(e.to_string()));
+                        let _ = reply.send(result);
+                        return;
+                    }
+                }
+            }
+            msg = ws_stream.next() => {
+                match msg {
+                    Some(Ok(tungstenite::Message::Text(text))) => {
+                        match serde_json::from_str::<ServerMessage>(&text) {
+                            Ok(server_msg) => {
+                                handle_server_message(
+                                    server_msg,
+                                    &mut pending,
+                                    &mut subscriptions,
+                                    &msg_tx,
+                                ).await;
+                            }
+                            Err(e) => {
+                                warn!("failed to parse server message: {e}");
+                            }
+                        }
+                    }
+                    Some(Ok(tungstenite::Message::Close(_))) | None => {
+                        warn!("connection closed, attempting reconnect");
+                        match handle_reconnect(
+                            &config, &endpoint_id, &subscriptions,
+                            &mut reconnect_policy, &mut pending,
+                            &mut ws_sink, &mut ws_stream,
+                        ).await {
+                            Ok(()) => {}
+                            Err(e) => {
+                                error!("reconnection failed permanently: {e}");
+                                return;
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {
+                        // Ignore non-text frames (ping/pong handled by tungstenite).
+                    }
+                    Some(Err(e)) => {
+                        warn!("WebSocket error: {e}, attempting reconnect");
+                        match handle_reconnect(
+                            &config, &endpoint_id, &subscriptions,
+                            &mut reconnect_policy, &mut pending,
+                            &mut ws_sink, &mut ws_stream,
+                        ).await {
+                            Ok(()) => {}
+                            Err(e) => {
+                                error!("reconnection failed permanently: {e}");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Handles the reconnect flow: fails pending requests, attempts reconnect, and
+/// replaces the sink/stream on success.
+async fn handle_reconnect(
+    config: &ClientConfig,
+    endpoint_id: &EndpointId,
+    subscriptions: &HashSet<Topic>,
+    reconnect_policy: &mut ReconnectPolicy,
+    pending: &mut Vec<Pending>,
+    ws_sink: &mut WsSink,
+    ws_stream: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+) -> Result<()> {
+    fail_pending(pending);
+    let (new_sink, new_stream) =
+        attempt_reconnect(config, endpoint_id, subscriptions, reconnect_policy).await?;
+    *ws_sink = new_sink;
+    *ws_stream = new_stream;
+    reconnect_policy.reset();
+    debug!("reconnected to broker");
+    Ok(())
+}
+
+/// Dispatches a server message to the appropriate pending request or the
+/// incoming message channel.
+async fn handle_server_message(
+    server_msg: ServerMessage,
+    pending: &mut Vec<Pending>,
+    subscriptions: &mut HashSet<Topic>,
+    msg_tx: &mpsc::Sender<Message>,
+) {
+    match server_msg {
+        ServerMessage::MessageReceived { message } => {
+            if msg_tx.send(message).await.is_err() {
+                warn!("message receiver dropped, discarding message");
+            }
+        }
+        ServerMessage::Subscribed { topic } => {
+            if let Some(idx) = pending
+                .iter()
+                .position(|p| matches!(p, Pending::Subscribe(t, _) if *t == topic))
+            {
+                subscriptions.insert(topic);
+                if let Pending::Subscribe(_, reply) = pending.remove(idx) {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        }
+        ServerMessage::Unsubscribed { topic } => {
+            if let Some(idx) = pending
+                .iter()
+                .position(|p| matches!(p, Pending::Unsubscribe(t, _) if *t == topic))
+            {
+                subscriptions.remove(&topic);
+                if let Pending::Unsubscribe(_, reply) = pending.remove(idx) {
+                    let _ = reply.send(Ok(()));
+                }
+            }
+        }
+        ServerMessage::EndpointList { endpoints } => {
+            if let Some(idx) = pending
+                .iter()
+                .position(|p| matches!(p, Pending::ListEndpoints(_)))
+                && let Pending::ListEndpoints(reply) = pending.remove(idx)
+            {
+                let _ = reply.send(Ok(endpoints));
+            }
+        }
+        ServerMessage::TopicList { topics } => {
+            if let Some(idx) = pending
+                .iter()
+                .position(|p| matches!(p, Pending::ListTopics(_)))
+                && let Pending::ListTopics(reply) = pending.remove(idx)
+            {
+                let _ = reply.send(Ok(topics));
+            }
+        }
+        ServerMessage::Ack { .. } => {
+            if let Some(idx) = pending.iter().position(|p| matches!(p, Pending::Send(_)))
+                && let Pending::Send(reply) = pending.remove(idx)
+            {
+                let _ = reply.send(Ok(()));
+            }
+        }
+        ServerMessage::Error { code, message } => {
+            // Route the error to the oldest pending request.
+            if !pending.is_empty() {
+                let err = ClientError::Broker {
+                    code,
+                    message: message.clone(),
+                };
+                match pending.remove(0) {
+                    Pending::Subscribe(_, reply) => {
+                        let _ = reply.send(Err(err));
+                    }
+                    Pending::Unsubscribe(_, reply) => {
+                        let _ = reply.send(Err(err));
+                    }
+                    Pending::ListEndpoints(reply) => {
+                        let _ = reply.send(Err(err));
+                    }
+                    Pending::ListTopics(reply) => {
+                        let _ = reply.send(Err(err));
+                    }
+                    Pending::Send(reply) => {
+                        let _ = reply.send(Err(err));
+                    }
+                }
+            } else {
+                warn!("broker error with no pending request: [{code}] {message}");
+            }
+        }
+        _ => {
+            debug!("ignoring unexpected server message");
+        }
+    }
+}
+
+/// Fail all pending requests with a disconnection error.
+fn fail_pending(pending: &mut Vec<Pending>) {
+    let err_msg = "connection lost during pending request";
+    for p in pending.drain(..) {
+        match p {
+            Pending::Subscribe(_, reply) => {
+                let _ = reply.send(Err(ClientError::Connection(err_msg.into())));
+            }
+            Pending::Unsubscribe(_, reply) => {
+                let _ = reply.send(Err(ClientError::Connection(err_msg.into())));
+            }
+            Pending::ListEndpoints(reply) => {
+                let _ = reply.send(Err(ClientError::Connection(err_msg.into())));
+            }
+            Pending::ListTopics(reply) => {
+                let _ = reply.send(Err(ClientError::Connection(err_msg.into())));
+            }
+            Pending::Send(reply) => {
+                let _ = reply.send(Err(ClientError::Connection(err_msg.into())));
+            }
+        }
+    }
+}
+
+/// Attempts to reconnect to the broker with exponential backoff, re-authenticate,
+/// re-register, and re-subscribe to all previous topics.
+async fn attempt_reconnect(
+    config: &ClientConfig,
+    endpoint_id: &EndpointId,
+    subscriptions: &HashSet<Topic>,
+    policy: &mut ReconnectPolicy,
+) -> Result<(
+    WsSink,
+    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+)> {
+    loop {
+        // Re-read token from disk in case it was rotated. Token-read failures
+        // are transient and should not consume a retry.
+        let token = match read_token(&config.token_path).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("reconnect token read failed: {e}");
+                tokio::time::sleep(policy.peek_delay()).await;
+                continue;
+            }
+        };
+
+        let delay = policy
+            .next_delay()
+            .ok_or_else(|| ClientError::Connection("max reconnect retries exceeded".into()))?;
+
+        debug!(?delay, "waiting before reconnect attempt");
+        tokio::time::sleep(delay).await;
+
+        // Try to establish a new connection.
+        let (mut ws_sink, mut ws_stream) = match establish_connection(&config.broker_url).await {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("reconnect attempt failed: {e}");
+                continue;
+            }
+        };
+
+        // Re-authenticate and re-register.
+        match handshake(&mut ws_sink, &mut ws_stream, &token, endpoint_id).await {
+            Ok(()) => {}
+            Err(e @ (ClientError::Auth(_) | ClientError::Broker { .. })) => {
+                // Auth rejection or broker error is permanent, stop retrying.
+                return Err(e);
+            }
+            Err(e) => {
+                warn!("reconnect handshake failed: {e}");
+                continue;
+            }
+        }
+
+        // Re-subscribe to all topics. Fail the entire reconnect if any subscription fails
+        // so the caller retries with a fresh connection.
+        let mut subscribe_failed = false;
+        for topic in subscriptions {
+            if let Err(e) = send_raw_direct(
+                &mut ws_sink,
+                &ClientMessage::Subscribe {
+                    topic: topic.clone(),
+                },
+            )
+            .await
+            {
+                warn!(topic = %topic, "reconnect subscribe send failed: {e}");
+                subscribe_failed = true;
+                break;
+            }
+            match recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await {
+                Ok(ServerMessage::Subscribed { .. }) => {}
+                Ok(other) => {
+                    warn!(topic = %topic, "unexpected response during reconnect subscribe: {other:?}");
+                    subscribe_failed = true;
+                    break;
+                }
+                Err(e) => {
+                    warn!(topic = %topic, "reconnect subscribe recv failed: {e}");
+                    subscribe_failed = true;
+                    break;
+                }
+            }
+        }
+        if subscribe_failed {
+            continue;
+        }
+
+        return Ok((ws_sink, ws_stream));
+    }
+}
+
+/// Performs the auth + register handshake sequence on an already-connected WebSocket.
+async fn handshake(
+    ws_sink: &mut WsSink,
+    ws_stream: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    token: &str,
+    endpoint_id: &EndpointId,
+) -> Result<()> {
+    // Auth.
+    send_raw_direct(
+        ws_sink,
+        &ClientMessage::Auth {
+            token: token.to_owned(),
+        },
+    )
+    .await?;
+    let auth_response = recv_raw_timeout(ws_stream, HANDSHAKE_TIMEOUT).await?;
+    match auth_response {
+        ServerMessage::AuthResult { success: true, .. } => {
+            debug!("authenticated with broker");
+        }
+        ServerMessage::AuthResult {
+            success: false,
+            error,
+        } => {
+            return Err(ClientError::Auth(
+                error.unwrap_or_else(|| "unknown auth error".into()),
+            ));
+        }
+        other => {
+            return Err(ClientError::Protocol(format!(
+                "expected AuthResult, got: {other:?}"
+            )));
+        }
+    }
+
+    // Register.
+    send_raw_direct(
+        ws_sink,
+        &ClientMessage::Register {
+            name: endpoint_id.clone(),
+        },
+    )
+    .await?;
+    let reg_response = recv_raw_timeout(ws_stream, HANDSHAKE_TIMEOUT).await?;
+    match reg_response {
+        ServerMessage::Registered { .. } => {
+            debug!(name = %endpoint_id, "registered with broker");
+        }
+        ServerMessage::Error { code, message } => {
+            return Err(ClientError::Broker { code, message });
+        }
+        other => {
+            return Err(ClientError::Protocol(format!(
+                "expected Registered, got: {other:?}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Establishes a raw WebSocket connection and splits it into read/write halves.
+async fn establish_connection(
+    url: &str,
+) -> Result<(
+    WsSink,
+    futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+)> {
+    let (ws_stream, _response) = connect_async(url)
+        .await
+        .map_err(|e| ClientError::Connection(e.to_string()))?;
+    Ok(ws_stream.split())
+}
+
+/// Sends a serialized `ClientMessage` directly through a mutable sink reference.
+async fn send_raw_direct(sink: &mut WsSink, msg: &ClientMessage) -> Result<()> {
+    let text = serde_json::to_string(msg)?;
+    sink.send(tungstenite::Message::text(text))
+        .await
+        .map_err(|e| ClientError::Send(e.to_string()))
+}
+
+/// Reads the next text frame from the WebSocket stream and deserializes it,
+/// with a timeout to avoid waiting indefinitely during handshakes.
+async fn recv_raw_timeout(
+    stream: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    timeout: Duration,
+) -> Result<ServerMessage> {
+    tokio::time::timeout(timeout, recv_raw(stream))
+        .await
+        .map_err(|_| ClientError::Receive("handshake timed out".into()))?
+}
+
+/// Reads the next text frame from the WebSocket stream and deserializes it.
+async fn recv_raw(
+    stream: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+) -> Result<ServerMessage> {
+    loop {
+        match stream.next().await {
+            Some(Ok(tungstenite::Message::Text(text))) => {
+                return serde_json::from_str::<ServerMessage>(&text)
+                    .map_err(|e| ClientError::Protocol(e.to_string()));
+            }
+            Some(Ok(_)) => {
+                // Skip non-text frames.
+                continue;
+            }
+            Some(Err(e)) => {
+                return Err(ClientError::Receive(e.to_string()));
+            }
+            None => {
+                return Err(ClientError::Receive("connection closed".into()));
+            }
+        }
+    }
+}
+
+/// Reads the authentication token from the given path.
+async fn read_token(path: &std::path::Path) -> Result<String> {
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|e| ClientError::TokenRead(format!("{}: {e}", path.display())))?;
+    Ok(contents.trim().to_owned())
+}
+
+/// Returns the current time in milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use herald_core::{Address, EndpointId, ErrorCode, Message, ServerMessage, Topic};
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::{Pending, handle_server_message};
+
+    fn make_message() -> Message {
+        Message {
+            from: EndpointId::new("sender").unwrap(),
+            to: Address::Direct(EndpointId::new("receiver").unwrap()),
+            payload: serde_json::json!({"hello": "world"}),
+            metadata: None,
+            timestamp: 1000,
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_routes_to_pending_send() {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::Send(reply_tx)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::Ack { id: None },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(reply_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn subscribed_routes_to_pending_subscribe() {
+        let topic = Topic::new("events").unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::Subscribe(topic.clone(), reply_tx)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::Subscribed {
+                topic: topic.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert!(subscriptions.contains(&topic));
+    }
+
+    #[tokio::test]
+    async fn error_routes_to_oldest_pending() {
+        let (reply_tx_1, reply_rx_1) = oneshot::channel();
+        let (reply_tx_2, _reply_rx_2) = oneshot::channel();
+        let mut pending = vec![Pending::Send(reply_tx_1), Pending::Send(reply_tx_2)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::Error {
+                code: ErrorCode::EndpointNotFound,
+                message: "not found".into(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        // The oldest (first) pending should receive the error.
+        assert_eq!(pending.len(), 1);
+        let result = reply_rx_1.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn message_received_forwards_to_channel() {
+        let mut pending = Vec::new();
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, mut msg_rx) = mpsc::channel(16);
+
+        let message = make_message();
+        handle_server_message(
+            ServerMessage::MessageReceived {
+                message: message.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        let received = msg_rx.try_recv().unwrap();
+        assert_eq!(received, message);
+    }
+
+    #[tokio::test]
+    async fn unknown_message_ignored() {
+        let mut pending = Vec::new();
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, mut msg_rx) = mpsc::channel(16);
+
+        // AuthResult is not handled in the main message loop (only during handshake).
+        handle_server_message(
+            ServerMessage::AuthResult {
+                success: true,
+                error: None,
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(msg_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unsubscribed_routes_to_pending_unsubscribe() {
+        let topic = Topic::new("events").unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::Unsubscribe(topic.clone(), reply_tx)];
+        let mut subscriptions = std::collections::HashSet::from([topic.clone()]);
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::Unsubscribed {
+                topic: topic.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert!(!subscriptions.contains(&topic));
+    }
+
+    #[tokio::test]
+    async fn endpoint_list_routes_to_pending() {
+        let endpoints = vec![EndpointId::new("a").unwrap(), EndpointId::new("b").unwrap()];
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::ListEndpoints(reply_tx)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::EndpointList {
+                endpoints: endpoints.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert_eq!(reply_rx.await.unwrap().unwrap(), endpoints);
+    }
+
+    #[tokio::test]
+    async fn topic_list_routes_to_pending() {
+        let topics = vec![Topic::new("t1").unwrap(), Topic::new("t2").unwrap()];
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::ListTopics(reply_tx)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::TopicList {
+                topics: topics.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert_eq!(reply_rx.await.unwrap().unwrap(), topics);
+    }
+}

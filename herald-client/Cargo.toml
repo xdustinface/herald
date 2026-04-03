@@ -8,8 +8,10 @@ repository.workspace = true
 description = "Client library for connecting to the Herald message broker"
 
 [dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["alloc", "sink"] }
 herald-core = { path = "../herald-core" }
+serde_json = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
-serde_json = "1"
 tracing = "0.1"
