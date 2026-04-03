@@ -85,56 +85,7 @@ impl HeraldClient {
 
         let (mut ws_sink, mut ws_stream) = establish_connection(&config.broker_url).await?;
 
-        // Auth handshake.
-        send_raw_direct(
-            &mut ws_sink,
-            &ClientMessage::Auth {
-                token: token.clone(),
-            },
-        )
-        .await?;
-        let auth_response = recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await?;
-        match auth_response {
-            ServerMessage::AuthResult { success: true, .. } => {
-                debug!("authenticated with broker");
-            }
-            ServerMessage::AuthResult {
-                success: false,
-                error,
-            } => {
-                return Err(ClientError::Auth(
-                    error.unwrap_or_else(|| "unknown auth error".into()),
-                ));
-            }
-            other => {
-                return Err(ClientError::Protocol(format!(
-                    "expected AuthResult, got: {other:?}"
-                )));
-            }
-        }
-
-        // Register endpoint.
-        send_raw_direct(
-            &mut ws_sink,
-            &ClientMessage::Register {
-                name: endpoint_id.clone(),
-            },
-        )
-        .await?;
-        let reg_response = recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await?;
-        match reg_response {
-            ServerMessage::Registered { .. } => {
-                debug!(name = %endpoint_id, "registered with broker");
-            }
-            ServerMessage::Error { code, message } => {
-                return Err(ClientError::Broker { code, message });
-            }
-            other => {
-                return Err(ClientError::Protocol(format!(
-                    "expected Registered, got: {other:?}"
-                )));
-            }
-        }
+        handshake(&mut ws_sink, &mut ws_stream, &token, &endpoint_id).await?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (msg_tx, msg_rx) = mpsc::channel(256);
@@ -567,54 +518,15 @@ async fn attempt_reconnect(
             }
         };
 
-        // Re-authenticate.
-        if let Err(e) = send_raw_direct(&mut ws_sink, &ClientMessage::Auth { token }).await {
-            warn!("reconnect auth send failed: {e}");
-            continue;
-        }
-        match recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await {
-            Ok(ServerMessage::AuthResult { success: true, .. }) => {}
-            Ok(ServerMessage::AuthResult {
-                success: false,
-                error,
-            }) => {
-                return Err(ClientError::Auth(
-                    error.unwrap_or_else(|| "auth failed on reconnect".into()),
-                ));
-            }
-            Ok(other) => {
-                warn!("unexpected response during reconnect auth: {other:?}");
-                continue;
+        // Re-authenticate and re-register.
+        match handshake(&mut ws_sink, &mut ws_stream, &token, endpoint_id).await {
+            Ok(()) => {}
+            Err(ClientError::Auth(_) | ClientError::Broker { .. }) => {
+                // Auth rejection or broker error is permanent, stop retrying.
+                return Err(ClientError::Auth("handshake failed on reconnect".into()));
             }
             Err(e) => {
-                warn!("reconnect auth recv failed: {e}");
-                continue;
-            }
-        }
-
-        // Re-register.
-        if let Err(e) = send_raw_direct(
-            &mut ws_sink,
-            &ClientMessage::Register {
-                name: endpoint_id.clone(),
-            },
-        )
-        .await
-        {
-            warn!("reconnect register send failed: {e}");
-            continue;
-        }
-        match recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await {
-            Ok(ServerMessage::Registered { .. }) => {}
-            Ok(ServerMessage::Error { code, message }) => {
-                return Err(ClientError::Broker { code, message });
-            }
-            Ok(other) => {
-                warn!("unexpected response during reconnect register: {other:?}");
-                continue;
-            }
-            Err(e) => {
-                warn!("reconnect register recv failed: {e}");
+                warn!("reconnect handshake failed: {e}");
                 continue;
             }
         }
@@ -655,6 +567,67 @@ async fn attempt_reconnect(
 
         return Ok((ws_sink, ws_stream));
     }
+}
+
+/// Performs the auth + register handshake sequence on an already-connected WebSocket.
+async fn handshake(
+    ws_sink: &mut WsSink,
+    ws_stream: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    token: &str,
+    endpoint_id: &EndpointId,
+) -> Result<()> {
+    // Auth.
+    send_raw_direct(
+        ws_sink,
+        &ClientMessage::Auth {
+            token: token.to_owned(),
+        },
+    )
+    .await?;
+    let auth_response = recv_raw_timeout(ws_stream, HANDSHAKE_TIMEOUT).await?;
+    match auth_response {
+        ServerMessage::AuthResult { success: true, .. } => {
+            debug!("authenticated with broker");
+        }
+        ServerMessage::AuthResult {
+            success: false,
+            error,
+        } => {
+            return Err(ClientError::Auth(
+                error.unwrap_or_else(|| "unknown auth error".into()),
+            ));
+        }
+        other => {
+            return Err(ClientError::Protocol(format!(
+                "expected AuthResult, got: {other:?}"
+            )));
+        }
+    }
+
+    // Register.
+    send_raw_direct(
+        ws_sink,
+        &ClientMessage::Register {
+            name: endpoint_id.clone(),
+        },
+    )
+    .await?;
+    let reg_response = recv_raw_timeout(ws_stream, HANDSHAKE_TIMEOUT).await?;
+    match reg_response {
+        ServerMessage::Registered { .. } => {
+            debug!(name = %endpoint_id, "registered with broker");
+        }
+        ServerMessage::Error { code, message } => {
+            return Err(ClientError::Broker { code, message });
+        }
+        other => {
+            return Err(ClientError::Protocol(format!(
+                "expected Registered, got: {other:?}"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 /// Establishes a raw WebSocket connection and splits it into read/write halves.

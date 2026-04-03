@@ -45,8 +45,3 @@ impl From<serde_json::Error> for ClientError {
     }
 }
 
-impl From<std::io::Error> for ClientError {
-    fn from(err: std::io::Error) -> Self {
-        ClientError::TokenRead(err.to_string())
-    }
-}

@@ -24,6 +24,17 @@ pub struct ReconnectConfig {
     pub(crate) max_retries: Option<u32>,
 }
 
+impl ReconnectConfig {
+    /// Creates a new reconnection configuration.
+    pub fn new(initial_delay: Duration, max_delay: Duration, max_retries: Option<u32>) -> Self {
+        Self {
+            initial_delay,
+            max_delay,
+            max_retries,
+        }
+    }
+}
+
 impl Default for ReconnectConfig {
     fn default() -> Self {
         Self {
