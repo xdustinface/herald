@@ -73,8 +73,7 @@ impl TryFrom<String> for EndpointId {
     type Error = Error;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        validate_name(&s)?;
-        Ok(Self(s))
+        Self::new(s)
     }
 }
 
@@ -121,8 +120,7 @@ impl TryFrom<String> for Topic {
     type Error = Error;
 
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        validate_name(&s)?;
-        Ok(Self(s))
+        Self::new(s)
     }
 }
 

@@ -35,6 +35,16 @@ pub enum ErrorCode {
     InternalError,
 }
 
+impl From<&Error> for ErrorCode {
+    fn from(err: &Error) -> Self {
+        match err {
+            Error::InvalidName(_) => ErrorCode::InvalidName,
+            Error::Serialization(_) => ErrorCode::InternalError,
+            Error::Protocol(_) => ErrorCode::InternalError,
+        }
+    }
+}
+
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

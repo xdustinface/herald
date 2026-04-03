@@ -421,4 +421,20 @@ mod tests {
         assert_eq!(ErrorCode::NameTaken.to_string(), "NameTaken");
         assert_eq!(ErrorCode::EndpointNotFound.to_string(), "EndpointNotFound");
     }
+
+    #[test]
+    fn error_to_error_code_conversion() {
+        assert_eq!(
+            ErrorCode::from(&Error::InvalidName("bad".into())),
+            ErrorCode::InvalidName,
+        );
+        assert_eq!(
+            ErrorCode::from(&Error::Serialization("parse failed".into())),
+            ErrorCode::InternalError,
+        );
+        assert_eq!(
+            ErrorCode::from(&Error::Protocol("unexpected".into())),
+            ErrorCode::InternalError,
+        );
+    }
 }
