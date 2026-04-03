@@ -1,9 +1,13 @@
-name: Manki Review
+name: Manki
 
 on:
   pull_request:
     types: [opened, synchronize]
+  pull_request_review:
+    types: [submitted, dismissed]
   issue_comment:
+    types: [created, edited]
+  pull_request_review_comment:
     types: [created]
 
 permissions:
@@ -14,14 +18,23 @@ permissions:
 
 jobs:
   review:
-    if: >
-      (github.event_name == 'pull_request') ||
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@manki'))
+    if: github.actor != 'manki-review[bot]'
+    concurrency:
+      group: manki-${{ github.event_name }}-${{ github.event.comment.id || github.event.pull_request.number || github.event.issue.number || github.run_id }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          fetch-depth: 0
-      - uses: xdustinface/manki@v1
+          node-version: '20'
+          cache: 'npm'
+      - name: Install Claude Code CLI
+        run: npm install -g @anthropic-ai/claude-code
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+      - name: Manki Review
+        uses: xdustinface/manki@v4
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
