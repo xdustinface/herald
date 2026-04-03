@@ -11,7 +11,12 @@ pub enum ClientMessage {
     /// Register an endpoint name.
     Register { name: EndpointId },
     /// Send a message through the broker.
-    Send { message: Message },
+    Send {
+        /// Optional request ID for correlating with `Ack` responses.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        message: Message,
+    },
     /// Subscribe to a topic.
     Subscribe { topic: Topic },
     /// Unsubscribe from a topic.

@@ -207,6 +207,7 @@ mod tests {
     #[test]
     fn client_message_send_roundtrip() {
         let msg = ClientMessage::Send {
+            id: None,
             message: Message {
                 from: EndpointId::new("a").unwrap(),
                 to: Address::Direct(EndpointId::new("b").unwrap()),
@@ -218,6 +219,23 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
+        assert!(!json.contains("\"id\""));
+
+        let msg_with_id = ClientMessage::Send {
+            id: Some("req-42".into()),
+            message: Message {
+                from: EndpointId::new("a").unwrap(),
+                to: Address::Direct(EndpointId::new("b").unwrap()),
+                payload: json!("hello"),
+                metadata: None,
+                timestamp: 123,
+            },
+        };
+        let json = serde_json::to_string(&msg_with_id).unwrap();
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg_with_id, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["id"], "req-42");
     }
 
     #[test]
@@ -228,6 +246,20 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let back: ClientMessage = serde_json::from_str(&json).unwrap();
         assert_eq!(msg, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "Subscribe");
+    }
+
+    #[test]
+    fn client_message_unsubscribe_roundtrip() {
+        let msg = ClientMessage::Unsubscribe {
+            topic: Topic::new("events").unwrap(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ClientMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "Unsubscribe");
     }
 
     #[test]
@@ -308,6 +340,14 @@ mod tests {
     }
 
     // --- Error display ---
+
+    #[test]
+    fn error_from_serde_json() {
+        let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let err_msg = serde_err.to_string();
+        let err: Error = serde_err.into();
+        assert!(matches!(err, Error::Serialization(ref s) if s == &err_msg));
+    }
 
     #[test]
     fn error_display() {
