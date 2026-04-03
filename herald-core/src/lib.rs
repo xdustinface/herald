@@ -324,6 +324,60 @@ mod tests {
     }
 
     #[test]
+    fn server_message_received_roundtrip() {
+        let msg = ServerMessage::MessageReceived {
+            message: Message {
+                from: EndpointId::new("alice").unwrap(),
+                to: Address::Direct(EndpointId::new("bob").unwrap()),
+                payload: json!({"text": "hello"}),
+                metadata: None,
+                timestamp: 1700000000000,
+            },
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "MessageReceived");
+    }
+
+    #[test]
+    fn server_message_subscribed_roundtrip() {
+        let msg = ServerMessage::Subscribed {
+            topic: Topic::new("events").unwrap(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "Subscribed");
+    }
+
+    #[test]
+    fn server_message_unsubscribed_roundtrip() {
+        let msg = ServerMessage::Unsubscribed {
+            topic: Topic::new("events").unwrap(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "Unsubscribed");
+    }
+
+    #[test]
+    fn server_message_topic_list_roundtrip() {
+        let msg = ServerMessage::TopicList {
+            topics: vec![Topic::new("events").unwrap(), Topic::new("chat").unwrap()],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        let back: ServerMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(msg, back);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["type"], "TopicList");
+    }
+
+    #[test]
     fn server_message_ack_roundtrip() {
         let msg = ServerMessage::Ack { id: None };
         let json = serde_json::to_string(&msg).unwrap();
