@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use herald_core::{Address, ClientMessage, EndpointId, Message, ServerMessage, Topic};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{debug, error, warn};
@@ -14,6 +14,9 @@ use tracing::{debug, error, warn};
 use crate::config::ClientConfig;
 use crate::error::ClientError;
 use crate::reconnect::ReconnectPolicy;
+
+/// Timeout applied to handshake responses (auth, register) during connect and reconnect.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, tungstenite::Message>;
 type Result<T> = std::result::Result<T, ClientError>;
@@ -58,9 +61,18 @@ enum Command {
 /// async methods for sending and receiving messages. Automatically reconnects
 /// on connection loss using exponential backoff.
 pub struct HeraldClient {
+    endpoint_id: EndpointId,
     cmd_tx: mpsc::Sender<Command>,
     msg_rx: mpsc::Receiver<Message>,
-    _task: tokio::task::JoinHandle<()>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for HeraldClient {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
 }
 
 impl HeraldClient {
@@ -71,18 +83,17 @@ impl HeraldClient {
 
         let token = read_token(&config.token_path).await?;
 
-        let (ws_sink, mut ws_stream) = establish_connection(&config.broker_url).await?;
-        let ws_sink = Arc::new(Mutex::new(ws_sink));
+        let (mut ws_sink, mut ws_stream) = establish_connection(&config.broker_url).await?;
 
         // Auth handshake.
-        send_raw(
-            &ws_sink,
+        send_raw_direct(
+            &mut ws_sink,
             &ClientMessage::Auth {
                 token: token.clone(),
             },
         )
         .await?;
-        let auth_response = recv_raw(&mut ws_stream).await?;
+        let auth_response = recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await?;
         match auth_response {
             ServerMessage::AuthResult { success: true, .. } => {
                 debug!("authenticated with broker");
@@ -103,14 +114,14 @@ impl HeraldClient {
         }
 
         // Register endpoint.
-        send_raw(
-            &ws_sink,
+        send_raw_direct(
+            &mut ws_sink,
             &ClientMessage::Register {
                 name: endpoint_id.clone(),
             },
         )
         .await?;
-        let reg_response = recv_raw(&mut ws_stream).await?;
+        let reg_response = recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await?;
         match reg_response {
             ServerMessage::Registered { .. } => {
                 debug!(name = %endpoint_id, "registered with broker");
@@ -130,8 +141,7 @@ impl HeraldClient {
 
         let task = tokio::spawn(connection_task(
             config,
-            endpoint_id,
-            token,
+            endpoint_id.clone(),
             ws_sink,
             ws_stream,
             cmd_rx,
@@ -139,9 +149,10 @@ impl HeraldClient {
         ));
 
         Ok(Self {
+            endpoint_id,
             cmd_tx,
             msg_rx,
-            _task: task,
+            task: Some(task),
         })
     }
 
@@ -154,7 +165,7 @@ impl HeraldClient {
     ) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let message = Message {
-            from: EndpointId::new("placeholder").unwrap(),
+            from: self.endpoint_id.clone(),
             to,
             payload,
             metadata,
@@ -250,8 +261,7 @@ impl HeraldClient {
 async fn connection_task(
     config: ClientConfig,
     endpoint_id: EndpointId,
-    token: String,
-    ws_sink: Arc<Mutex<WsSink>>,
+    mut ws_sink: WsSink,
     mut ws_stream: futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     mut cmd_rx: mpsc::Receiver<Command>,
     msg_tx: mpsc::Sender<Message>,
@@ -266,7 +276,7 @@ async fn connection_task(
                 match cmd {
                     Command::Send { message, reply } => {
                         let client_msg = ClientMessage::Send { id: None, message };
-                        match send_raw(&ws_sink, &client_msg).await {
+                        match send_raw_direct(&mut ws_sink, &client_msg).await {
                             Ok(()) => {
                                 pending.push(Pending::Send(reply));
                             }
@@ -277,7 +287,7 @@ async fn connection_task(
                     }
                     Command::Subscribe { topic, reply } => {
                         let client_msg = ClientMessage::Subscribe { topic: topic.clone() };
-                        match send_raw(&ws_sink, &client_msg).await {
+                        match send_raw_direct(&mut ws_sink, &client_msg).await {
                             Ok(()) => {
                                 pending.push(Pending::Subscribe(topic, reply));
                             }
@@ -288,7 +298,7 @@ async fn connection_task(
                     }
                     Command::Unsubscribe { topic, reply } => {
                         let client_msg = ClientMessage::Unsubscribe { topic: topic.clone() };
-                        match send_raw(&ws_sink, &client_msg).await {
+                        match send_raw_direct(&mut ws_sink, &client_msg).await {
                             Ok(()) => {
                                 pending.push(Pending::Unsubscribe(topic, reply));
                             }
@@ -298,7 +308,7 @@ async fn connection_task(
                         }
                     }
                     Command::ListEndpoints { reply } => {
-                        match send_raw(&ws_sink, &ClientMessage::ListEndpoints).await {
+                        match send_raw_direct(&mut ws_sink, &ClientMessage::ListEndpoints).await {
                             Ok(()) => {
                                 pending.push(Pending::ListEndpoints(reply));
                             }
@@ -308,7 +318,7 @@ async fn connection_task(
                         }
                     }
                     Command::ListTopics { reply } => {
-                        match send_raw(&ws_sink, &ClientMessage::ListTopics).await {
+                        match send_raw_direct(&mut ws_sink, &ClientMessage::ListTopics).await {
                             Ok(()) => {
                                 pending.push(Pending::ListTopics(reply));
                             }
@@ -318,8 +328,8 @@ async fn connection_task(
                         }
                     }
                     Command::Disconnect { reply } => {
-                        let mut sink = ws_sink.lock().await;
-                        let result = sink.close().await
+                        fail_pending(&mut pending);
+                        let result = ws_sink.close().await
                             .map_err(|e| ClientError::Connection(e.to_string()));
                         let _ = reply.send(result);
                         return;
@@ -345,22 +355,12 @@ async fn connection_task(
                     }
                     Some(Ok(tungstenite::Message::Close(_))) | None => {
                         warn!("connection closed, attempting reconnect");
-                        // Fail all pending requests.
-                        fail_pending(&mut pending);
-
-                        match attempt_reconnect(
-                            &config,
-                            &endpoint_id,
-                            &token,
-                            &subscriptions,
-                            &mut reconnect_policy,
+                        match handle_reconnect(
+                            &config, &endpoint_id, &subscriptions,
+                            &mut reconnect_policy, &mut pending,
+                            &mut ws_sink, &mut ws_stream,
                         ).await {
-                            Ok((new_sink, new_stream)) => {
-                                *ws_sink.lock().await = new_sink;
-                                ws_stream = new_stream;
-                                reconnect_policy.reset();
-                                debug!("reconnected to broker");
-                            }
+                            Ok(()) => {}
                             Err(e) => {
                                 error!("reconnection failed permanently: {e}");
                                 return;
@@ -372,21 +372,12 @@ async fn connection_task(
                     }
                     Some(Err(e)) => {
                         warn!("WebSocket error: {e}, attempting reconnect");
-                        fail_pending(&mut pending);
-
-                        match attempt_reconnect(
-                            &config,
-                            &endpoint_id,
-                            &token,
-                            &subscriptions,
-                            &mut reconnect_policy,
+                        match handle_reconnect(
+                            &config, &endpoint_id, &subscriptions,
+                            &mut reconnect_policy, &mut pending,
+                            &mut ws_sink, &mut ws_stream,
                         ).await {
-                            Ok((new_sink, new_stream)) => {
-                                *ws_sink.lock().await = new_sink;
-                                ws_stream = new_stream;
-                                reconnect_policy.reset();
-                                debug!("reconnected to broker");
-                            }
+                            Ok(()) => {}
                             Err(e) => {
                                 error!("reconnection failed permanently: {e}");
                                 return;
@@ -397,6 +388,27 @@ async fn connection_task(
             }
         }
     }
+}
+
+/// Handles the reconnect flow: fails pending requests, attempts reconnect, and
+/// replaces the sink/stream on success.
+async fn handle_reconnect(
+    config: &ClientConfig,
+    endpoint_id: &EndpointId,
+    subscriptions: &HashSet<Topic>,
+    reconnect_policy: &mut ReconnectPolicy,
+    pending: &mut Vec<Pending>,
+    ws_sink: &mut WsSink,
+    ws_stream: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+) -> Result<()> {
+    fail_pending(pending);
+    let (new_sink, new_stream) =
+        attempt_reconnect(config, endpoint_id, subscriptions, reconnect_policy).await?;
+    *ws_sink = new_sink;
+    *ws_stream = new_stream;
+    reconnect_policy.reset();
+    debug!("reconnected to broker");
+    Ok(())
 }
 
 /// Dispatches a server message to the appropriate pending request or the
@@ -523,7 +535,6 @@ fn fail_pending(pending: &mut Vec<Pending>) {
 async fn attempt_reconnect(
     config: &ClientConfig,
     endpoint_id: &EndpointId,
-    token: &str,
     subscriptions: &HashSet<Topic>,
     policy: &mut ReconnectPolicy,
 ) -> Result<(
@@ -538,29 +549,30 @@ async fn attempt_reconnect(
         debug!(?delay, "waiting before reconnect attempt");
         tokio::time::sleep(delay).await;
 
+        // Re-read token from disk in case it was rotated.
+        let token = match read_token(&config.token_path).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("reconnect token read failed: {e}");
+                continue;
+            }
+        };
+
         // Try to establish a new connection.
-        let (ws_sink, mut ws_stream) = match establish_connection(&config.broker_url).await {
+        let (mut ws_sink, mut ws_stream) = match establish_connection(&config.broker_url).await {
             Ok(pair) => pair,
             Err(e) => {
                 warn!("reconnect attempt failed: {e}");
                 continue;
             }
         };
-        let ws_sink = Arc::new(Mutex::new(ws_sink));
 
         // Re-authenticate.
-        if let Err(e) = send_raw(
-            &ws_sink,
-            &ClientMessage::Auth {
-                token: token.to_owned(),
-            },
-        )
-        .await
-        {
+        if let Err(e) = send_raw_direct(&mut ws_sink, &ClientMessage::Auth { token }).await {
             warn!("reconnect auth send failed: {e}");
             continue;
         }
-        match recv_raw(&mut ws_stream).await {
+        match recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await {
             Ok(ServerMessage::AuthResult { success: true, .. }) => {}
             Ok(ServerMessage::AuthResult {
                 success: false,
@@ -581,8 +593,8 @@ async fn attempt_reconnect(
         }
 
         // Re-register.
-        if let Err(e) = send_raw(
-            &ws_sink,
+        if let Err(e) = send_raw_direct(
+            &mut ws_sink,
             &ClientMessage::Register {
                 name: endpoint_id.clone(),
             },
@@ -592,7 +604,7 @@ async fn attempt_reconnect(
             warn!("reconnect register send failed: {e}");
             continue;
         }
-        match recv_raw(&mut ws_stream).await {
+        match recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await {
             Ok(ServerMessage::Registered { .. }) => {}
             Ok(ServerMessage::Error { code, message }) => {
                 return Err(ClientError::Broker { code, message });
@@ -607,10 +619,12 @@ async fn attempt_reconnect(
             }
         }
 
-        // Re-subscribe to all topics.
+        // Re-subscribe to all topics. Fail the entire reconnect if any subscription fails
+        // so the caller retries with a fresh connection.
+        let mut subscribe_failed = false;
         for topic in subscriptions {
-            if let Err(e) = send_raw(
-                &ws_sink,
+            if let Err(e) = send_raw_direct(
+                &mut ws_sink,
                 &ClientMessage::Subscribe {
                     topic: topic.clone(),
                 },
@@ -618,23 +632,28 @@ async fn attempt_reconnect(
             .await
             {
                 warn!(topic = %topic, "reconnect subscribe send failed: {e}");
-                continue;
+                subscribe_failed = true;
+                break;
             }
-            match recv_raw(&mut ws_stream).await {
+            match recv_raw_timeout(&mut ws_stream, HANDSHAKE_TIMEOUT).await {
                 Ok(ServerMessage::Subscribed { .. }) => {}
                 Ok(other) => {
                     warn!(topic = %topic, "unexpected response during reconnect subscribe: {other:?}");
+                    subscribe_failed = true;
+                    break;
                 }
                 Err(e) => {
                     warn!(topic = %topic, "reconnect subscribe recv failed: {e}");
+                    subscribe_failed = true;
+                    break;
                 }
             }
         }
+        if subscribe_failed {
+            continue;
+        }
 
-        let sink = Arc::into_inner(ws_sink)
-            .expect("sink has no other references during reconnect")
-            .into_inner();
-        return Ok((sink, ws_stream));
+        return Ok((ws_sink, ws_stream));
     }
 }
 
@@ -651,14 +670,23 @@ async fn establish_connection(
     Ok(ws_stream.split())
 }
 
-/// Sends a serialized `ClientMessage` through the WebSocket sink.
-async fn send_raw(sink: &Arc<Mutex<WsSink>>, msg: &ClientMessage) -> Result<()> {
+/// Sends a serialized `ClientMessage` directly through a mutable sink reference.
+async fn send_raw_direct(sink: &mut WsSink, msg: &ClientMessage) -> Result<()> {
     let text = serde_json::to_string(msg)?;
-    let mut guard = sink.lock().await;
-    guard
-        .send(tungstenite::Message::text(text))
+    sink.send(tungstenite::Message::text(text))
         .await
         .map_err(|e| ClientError::Send(e.to_string()))
+}
+
+/// Reads the next text frame from the WebSocket stream and deserializes it,
+/// with a timeout to avoid waiting indefinitely during handshakes.
+async fn recv_raw_timeout(
+    stream: &mut futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    timeout: Duration,
+) -> Result<ServerMessage> {
+    tokio::time::timeout(timeout, recv_raw(stream))
+        .await
+        .map_err(|_| ClientError::Receive("handshake timed out".into()))?
 }
 
 /// Reads the next text frame from the WebSocket stream and deserializes it.
@@ -695,8 +723,6 @@ async fn read_token(path: &std::path::Path) -> Result<String> {
 
 /// Returns the current time in milliseconds since the Unix epoch.
 fn now_ms() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
