@@ -44,4 +44,3 @@ impl From<serde_json::Error> for ClientError {
         ClientError::Protocol(err.to_string())
     }
 }
-
