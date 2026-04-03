@@ -1,0 +1,18 @@
+codecov:
+  notify:
+    after_n_builds: 1
+
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: 0%
+
+ignore:
+  - "**/tests/**"
+  - "**/tests.rs"
+  - "**/test_utils/**"
