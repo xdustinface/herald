@@ -5,6 +5,9 @@ use rusqlite::{Connection, params};
 
 use herald_core::{EndpointId, Message};
 
+/// Maximum number of pending messages stored per recipient.
+const MAX_PENDING_PER_RECIPIENT: usize = 10_000;
+
 /// SQLite-backed store for pending (undelivered) messages.
 pub struct MessageStore {
     conn: Connection,
@@ -38,8 +41,22 @@ impl MessageStore {
         Ok(Self { conn })
     }
 
-    /// Persists a message for an offline recipient.
+    /// Persists a message for an offline recipient. Rejects if the recipient
+    /// already has `MAX_PENDING_PER_RECIPIENT` stored messages.
     pub fn save_pending(&self, recipient: &EndpointId, message: &Message) -> rusqlite::Result<i64> {
+        let count: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM pending_messages WHERE recipient = ?1",
+            params![recipient.as_str()],
+            |row| row.get(0),
+        )?;
+        if count >= MAX_PENDING_PER_RECIPIENT {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(format!(
+                    "pending message limit ({MAX_PENDING_PER_RECIPIENT}) reached for {recipient}"
+                )),
+            )));
+        }
+
         let json = serde_json::to_string(message).map_err(|e| {
             rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,

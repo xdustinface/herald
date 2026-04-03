@@ -1,11 +1,15 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, error, info, warn};
+
+/// Maximum time allowed for the auth and registration handshake phases.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use herald_core::{ClientMessage, EndpointId, ErrorCode, ServerMessage};
 
@@ -63,9 +67,11 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
 
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
-    // Phase 1: Authenticate.
-    let authenticated = match wait_for_auth(&mut ws_stream, &state).await {
-        Some(true) => true,
+    // Phase 1: Authenticate (with timeout).
+    let auth_result =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, wait_for_auth(&mut ws_stream, &state)).await;
+    let authenticated = match auth_result {
+        Ok(Some(true)) => true,
         _ => {
             let msg = ServerMessage::AuthResult {
                 success: false,
@@ -88,19 +94,30 @@ async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<Mutex
         return;
     }
 
-    // Phase 2: Validate and reserve endpoint name (without registering a sender yet).
-    let endpoint_id = match wait_for_register(&mut ws_stream, &mut ws_sink, &state).await {
-        Some(id) => id,
-        None => return,
-    };
-
-    // Phase 3: Message loop — register with the real channel sender and deliver pending.
+    // Phase 2: Register endpoint (with timeout) — name check and registration happen atomically.
     let (tx, mut rx): (EndpointSender, mpsc::UnboundedReceiver<ServerMessage>) =
         mpsc::unbounded_channel();
 
+    let register_result = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        wait_for_register(&mut ws_stream, &mut ws_sink, &state, tx),
+    )
+    .await;
+    let endpoint_id = match register_result {
+        Ok(Some(id)) => id,
+        _ => {
+            let msg = ServerMessage::Error {
+                code: ErrorCode::InternalError,
+                message: "registration timed out".into(),
+            };
+            let _ = send_server_message(&mut ws_sink, &msg).await;
+            return;
+        }
+    };
+
+    // Deliver any pending messages from a previous session.
     {
-        let mut broker = state.lock().unwrap();
-        let _ = broker.router.register(endpoint_id.clone(), tx);
+        let broker = state.lock().unwrap();
         broker.router.deliver_pending(&endpoint_id, &broker.store);
     }
 
@@ -165,22 +182,25 @@ async fn wait_for_auth(
     None
 }
 
-/// Waits for a Register message after authentication. Validates the name is
-/// available but does not register a sender — the caller registers with the
-/// real channel sender after this returns.
+/// Waits for a Register message after authentication. Atomically checks name
+/// availability and registers the endpoint sender in a single lock acquisition.
 async fn wait_for_register(
     ws_stream: &mut (
              impl StreamExt<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>> + Unpin
          ),
     ws_sink: &mut (impl SinkExt<WsMessage> + Unpin),
     state: &Arc<Mutex<BrokerState>>,
+    sender: EndpointSender,
 ) -> Option<EndpointId> {
     while let Some(frame) = ws_stream.next().await {
         match frame {
             Ok(WsMessage::Text(text)) => {
                 if let Ok(ClientMessage::Register { name }) = serde_json::from_str(&text) {
-                    let name_taken = state.lock().unwrap().router.is_registered(&name);
-                    if name_taken {
+                    let result = {
+                        let mut broker = state.lock().unwrap();
+                        broker.router.register(name.clone(), sender)
+                    };
+                    if let Err(_code) = result {
                         let msg = ServerMessage::Error {
                             code: ErrorCode::NameTaken,
                             message: format!("endpoint name '{name}' is already taken"),

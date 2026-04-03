@@ -4,16 +4,20 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde::Deserialize;
 
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 9419;
+const DEFAULT_LOG_LEVEL: &str = "info";
+
 /// Herald message broker server.
 #[derive(Debug, Parser)]
 #[command(name = "herald-broker", version, about)]
 pub struct Cli {
     /// Bind address.
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value = DEFAULT_HOST)]
     pub host: IpAddr,
 
     /// Bind port.
-    #[arg(long, default_value_t = 9419)]
+    #[arg(long, default_value_t = DEFAULT_PORT)]
     pub port: u16,
 
     /// Data directory for token, database, and config.
@@ -21,7 +25,7 @@ pub struct Cli {
     pub data_dir: PathBuf,
 
     /// Log level (trace, debug, info, warn, error).
-    #[arg(long, default_value = "info")]
+    #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     pub log_level: String,
 }
 
@@ -63,13 +67,13 @@ impl BrokerConfig {
             cli.host
         };
 
-        let port = if cli.port == 9419 {
+        let port = if cli.port == DEFAULT_PORT {
             file_config.port.unwrap_or(cli.port)
         } else {
             cli.port
         };
 
-        let log_level = if cli.log_level == "info" {
+        let log_level = if cli.log_level == DEFAULT_LOG_LEVEL {
             file_config.log_level.unwrap_or(cli.log_level)
         } else {
             cli.log_level
@@ -85,7 +89,7 @@ impl BrokerConfig {
 }
 
 fn default_host() -> IpAddr {
-    "127.0.0.1".parse().unwrap()
+    DEFAULT_HOST.parse().unwrap()
 }
 
 fn default_data_dir() -> PathBuf {
@@ -121,6 +125,29 @@ mod tests {
         assert_eq!(config.port, 9419);
         assert_eq!(config.log_level, "info");
         assert_eq!(config.data_dir, dir);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_arg_overrides_toml() {
+        let dir = std::env::temp_dir().join(format!("herald-test-cli-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        fs::write(dir.join("config.toml"), "port = 8080\n").unwrap();
+
+        let cli = Cli {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 7777,
+            data_dir: dir.clone(),
+            log_level: "info".into(),
+        };
+
+        let config = BrokerConfig::from_cli(cli);
+
+        // CLI non-default port wins over TOML.
+        assert_eq!(config.port, 7777);
 
         let _ = fs::remove_dir_all(&dir);
     }

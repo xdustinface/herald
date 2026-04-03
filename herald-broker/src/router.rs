@@ -32,11 +32,6 @@ impl Router {
         }
     }
 
-    /// Returns whether an endpoint with the given id is currently registered.
-    pub(crate) fn is_registered(&self, id: &EndpointId) -> bool {
-        self.endpoints.contains_key(id)
-    }
-
     /// Registers a new endpoint. Returns an error if the name is already taken.
     pub fn register(&mut self, id: EndpointId, sender: EndpointSender) -> Result<(), ErrorCode> {
         if self.endpoints.contains_key(&id) {
@@ -255,7 +250,7 @@ mod tests {
         let store = MessageStore::in_memory().unwrap();
         let topic = Topic::new("events").unwrap();
 
-        let (alice_id, alice_tx, _alice_rx) = make_endpoint("alice");
+        let (alice_id, alice_tx, mut alice_rx) = make_endpoint("alice");
         let (bob_id, bob_tx, mut bob_rx) = make_endpoint("bob");
         let (charlie_id, charlie_tx, mut charlie_rx) = make_endpoint("charlie");
 
@@ -273,6 +268,7 @@ mod tests {
         // Bob and Charlie get the message, Alice (sender) does not.
         assert!(bob_rx.try_recv().is_ok());
         assert!(charlie_rx.try_recv().is_ok());
+        assert!(alice_rx.try_recv().is_err());
     }
 
     #[test]
@@ -337,6 +333,24 @@ mod tests {
 
         assert!(bob_rx.try_recv().is_ok());
         assert!(store.get_pending(&bob).unwrap().is_empty());
+    }
+
+    #[test]
+    fn closed_channel_falls_back_to_persistence() {
+        let mut router = Router::new();
+        let store = MessageStore::in_memory().unwrap();
+        let (bob_id, bob_tx, bob_rx) = make_endpoint("bob");
+
+        router.register(bob_id.clone(), bob_tx).unwrap();
+
+        // Drop the receiver to simulate a broken channel.
+        drop(bob_rx);
+
+        let msg = make_message("alice", Address::Direct(bob_id.clone()));
+        router.route_message(&msg, &store);
+
+        let pending = store.get_pending(&bob_id).unwrap();
+        assert_eq!(pending.len(), 1);
     }
 
     #[test]
