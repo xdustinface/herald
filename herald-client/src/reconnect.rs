@@ -34,6 +34,15 @@ impl ReconnectPolicy {
         Some(capped)
     }
 
+    /// Returns the current delay without advancing the attempt counter.
+    pub(crate) fn peek_delay(&self) -> Duration {
+        let delay = self
+            .config
+            .initial_delay
+            .saturating_mul(1 << self.attempt.min(16));
+        delay.min(self.config.max_delay)
+    }
+
     /// Resets the attempt counter after a successful reconnection.
     pub(crate) fn reset(&mut self) {
         self.attempt = 0;

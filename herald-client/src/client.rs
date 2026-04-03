@@ -493,21 +493,23 @@ async fn attempt_reconnect(
     futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
 )> {
     loop {
+        // Re-read token from disk in case it was rotated. Token-read failures
+        // are transient and should not consume a retry.
+        let token = match read_token(&config.token_path).await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("reconnect token read failed: {e}");
+                tokio::time::sleep(policy.peek_delay()).await;
+                continue;
+            }
+        };
+
         let delay = policy
             .next_delay()
             .ok_or_else(|| ClientError::Connection("max reconnect retries exceeded".into()))?;
 
         debug!(?delay, "waiting before reconnect attempt");
         tokio::time::sleep(delay).await;
-
-        // Re-read token from disk in case it was rotated.
-        let token = match read_token(&config.token_path).await {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("reconnect token read failed: {e}");
-                continue;
-            }
-        };
 
         // Try to establish a new connection.
         let (mut ws_sink, mut ws_stream) = match establish_connection(&config.broker_url).await {
@@ -521,9 +523,9 @@ async fn attempt_reconnect(
         // Re-authenticate and re-register.
         match handshake(&mut ws_sink, &mut ws_stream, &token, endpoint_id).await {
             Ok(()) => {}
-            Err(ClientError::Auth(_) | ClientError::Broker { .. }) => {
+            Err(e @ (ClientError::Auth(_) | ClientError::Broker { .. })) => {
                 // Auth rejection or broker error is permanent, stop retrying.
-                return Err(ClientError::Auth("handshake failed on reconnect".into()));
+                return Err(e);
             }
             Err(e) => {
                 warn!("reconnect handshake failed: {e}");
@@ -700,4 +702,199 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use herald_core::{Address, EndpointId, ErrorCode, Message, ServerMessage, Topic};
+    use tokio::sync::{mpsc, oneshot};
+
+    use super::{Pending, handle_server_message};
+
+    fn make_message() -> Message {
+        Message {
+            from: EndpointId::new("sender").unwrap(),
+            to: Address::Direct(EndpointId::new("receiver").unwrap()),
+            payload: serde_json::json!({"hello": "world"}),
+            metadata: None,
+            timestamp: 1000,
+        }
+    }
+
+    #[tokio::test]
+    async fn ack_routes_to_pending_send() {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::Send(reply_tx)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::Ack { id: None },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(reply_rx.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn subscribed_routes_to_pending_subscribe() {
+        let topic = Topic::new("events").unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::Subscribe(topic.clone(), reply_tx)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::Subscribed {
+                topic: topic.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert!(subscriptions.contains(&topic));
+    }
+
+    #[tokio::test]
+    async fn error_routes_to_oldest_pending() {
+        let (reply_tx_1, reply_rx_1) = oneshot::channel();
+        let (reply_tx_2, _reply_rx_2) = oneshot::channel();
+        let mut pending = vec![Pending::Send(reply_tx_1), Pending::Send(reply_tx_2)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::Error {
+                code: ErrorCode::EndpointNotFound,
+                message: "not found".into(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        // The oldest (first) pending should receive the error.
+        assert_eq!(pending.len(), 1);
+        let result = reply_rx_1.await.unwrap();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn message_received_forwards_to_channel() {
+        let mut pending = Vec::new();
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, mut msg_rx) = mpsc::channel(16);
+
+        let message = make_message();
+        handle_server_message(
+            ServerMessage::MessageReceived {
+                message: message.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        let received = msg_rx.try_recv().unwrap();
+        assert_eq!(received, message);
+    }
+
+    #[tokio::test]
+    async fn unknown_message_ignored() {
+        let mut pending = Vec::new();
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, mut msg_rx) = mpsc::channel(16);
+
+        // AuthResult is not handled in the main message loop (only during handshake).
+        handle_server_message(
+            ServerMessage::AuthResult {
+                success: true,
+                error: None,
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(msg_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unsubscribed_routes_to_pending_unsubscribe() {
+        let topic = Topic::new("events").unwrap();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::Unsubscribe(topic.clone(), reply_tx)];
+        let mut subscriptions = std::collections::HashSet::from([topic.clone()]);
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::Unsubscribed {
+                topic: topic.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert!(reply_rx.await.unwrap().is_ok());
+        assert!(!subscriptions.contains(&topic));
+    }
+
+    #[tokio::test]
+    async fn endpoint_list_routes_to_pending() {
+        let endpoints = vec![EndpointId::new("a").unwrap(), EndpointId::new("b").unwrap()];
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::ListEndpoints(reply_tx)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::EndpointList {
+                endpoints: endpoints.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert_eq!(reply_rx.await.unwrap().unwrap(), endpoints);
+    }
+
+    #[tokio::test]
+    async fn topic_list_routes_to_pending() {
+        let topics = vec![Topic::new("t1").unwrap(), Topic::new("t2").unwrap()];
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let mut pending = vec![Pending::ListTopics(reply_tx)];
+        let mut subscriptions = std::collections::HashSet::new();
+        let (msg_tx, _msg_rx) = mpsc::channel(16);
+
+        handle_server_message(
+            ServerMessage::TopicList {
+                topics: topics.clone(),
+            },
+            &mut pending,
+            &mut subscriptions,
+            &msg_tx,
+        )
+        .await;
+
+        assert!(pending.is_empty());
+        assert_eq!(reply_rx.await.unwrap().unwrap(), topics);
+    }
 }
